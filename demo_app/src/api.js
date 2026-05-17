@@ -36,11 +36,12 @@ export const api = {
    * @param {string} scenario - 'hallway' | 'consult' | 'unknown'
    * @returns {Promise<{recording_id: string, track_mode?: string}>}
    */
-  upload(file, scenario = 'unknown') {
+  upload(file, scenario = 'unknown', language = 'auto') {
     const fd = new FormData()
     const filename = file.name || `recording.${guessExt(file.type)}`
     fd.append('file', file, filename)
     fd.append('scenario', scenario)
+    fd.append('language', language)
     return fetch(`${BASE}/upload`, { method: 'POST', body: fd }).then(asJson)
   },
 

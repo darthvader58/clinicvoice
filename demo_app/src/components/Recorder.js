@@ -43,6 +43,7 @@ export function createRecorder({ onUpload, onError } = {}) {
     startedAt: 0,
     durationTimer: null,
     scenario: 'unknown',
+    language: 'auto',
   }
 
   let root
@@ -55,6 +56,7 @@ export function createRecorder({ onUpload, onError } = {}) {
   let fileInput
   let dropZone
   let scenarioSel
+  let languageSel
 
   function render(container) {
     root = document.createElement('section')
@@ -89,6 +91,19 @@ export function createRecorder({ onUpload, onError } = {}) {
               <option value="hallway">Hallway</option>
             </select>
           </label>
+
+          <label class="field">
+            <span class="field-label">Language</span>
+            <select data-role="language" class="select">
+              <option value="auto" selected>Auto-detect</option>
+              <option value="en">English</option>
+              <option value="hi">Hindi</option>
+              <option value="ur">Urdu</option>
+              <option value="ta">Tamil</option>
+              <option value="id">Indonesian (Bahasa)</option>
+              <option value="ms">Malay (Bahasa)</option>
+            </select>
+          </label>
         </div>
 
         <div class="status-line mono" data-role="status" role="status" aria-live="polite">Ready.</div>
@@ -113,6 +128,7 @@ export function createRecorder({ onUpload, onError } = {}) {
     fileInput = root.querySelector('[data-role="file"]')
     dropZone = root.querySelector('[data-role="drop"]')
     scenarioSel = root.querySelector('[data-role="scenario"]')
+    languageSel = root.querySelector('[data-role="language"]')
 
     bindEvents()
     drawIdleWaveform()
@@ -122,6 +138,9 @@ export function createRecorder({ onUpload, onError } = {}) {
     recordBtn.addEventListener('click', toggleRecording)
     scenarioSel.addEventListener('change', () => {
       state.scenario = scenarioSel.value
+    })
+    languageSel.addEventListener('change', () => {
+      state.language = languageSel.value
     })
 
     root.querySelector('[data-role="browse"]').addEventListener('click', () => {
@@ -235,9 +254,10 @@ export function createRecorder({ onUpload, onError } = {}) {
     recordBtn.disabled = true
     setStatus(`Uploading ${file.name} (${(file.size / 1024).toFixed(1)} KB)…`, 'uploading')
     try {
-      const result = await api.upload(file, state.scenario)
+      const result = await api.upload(file, state.scenario, state.language)
       setStatus(`Uploaded. recording_id=${result.recording_id}`, 'success')
-      if (onUpload) onUpload({ file, scenario: state.scenario, result })
+      if (onUpload)
+        onUpload({ file, scenario: state.scenario, language: state.language, result })
     } catch (err) {
       reportError(err)
       setStatus(`Upload failed: ${err.message}`, 'error')

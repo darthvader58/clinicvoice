@@ -1,0 +1,26 @@
+{
+  "escalation_high": [
+    "chest pain", "shortness of breath", "not breathing", "unresponsive",
+    "code blue", "crash", "cardiac arrest", "anaphylaxis", "seizing",
+    "seizure", "loss of consciousness", "acute abdomen", "stroke",
+    "hemorrhage", "bleeding out", "airway blocked", "oxygen dropping",
+    "saturation below 90", "bp dropping", "systolic below 80"
+  ],
+  "escalation_medium": [
+    "hypotension", "hypoglycemia", "SpO2", "temperature above 39",
+    "fever", "altered mental status", "confused", "agitated",
+    "potassium high", "sodium low", "creatinine rising", "deteriorating"
+  ],
+  "memory_triggers": [
+    "take", "prescribed", "prescription", "follow up", "return if",
+    "avoid", "allergic to", "allergy", "do not", "must not",
+    "referral", "specialist", "appointment", "admitted", "discharged",
+    "diagnosis", "diagnosed with", "condition is", "plan is"
+  ],
+  "handoff_triggers": [
+    "please check", "can you check", "make sure", "don't forget",
+    "before end of shift", "needs to be", "waiting for",
+    "results pending", "follow up on", "please review",
+    "patient in room", "needs attention"
+  ]
+}

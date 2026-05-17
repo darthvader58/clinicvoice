@@ -1,0 +1,21 @@
+{
+  "recording_id": "test_consult_001",
+  "reference_transcript": "The patient has tachycardia and elevated troponin levels. I am prescribing metformin 500 mg twice daily for the diabetes mellitus. Please follow up in two weeks and avoid strenuous activity. The ECG shows atrial fibrillation. We need to check the INR before starting warfarin.",
+  "segments": [
+    {"speaker_id": "S1", "start_ts": 0.0, "end_ts": 4.2, "text": "The patient has tachycardia and elevated troponin levels."},
+    {"speaker_id": "S2", "start_ts": 4.5, "end_ts": 9.8, "text": "I am prescribing metformin 500 mg twice daily for the diabetes mellitus."},
+    {"speaker_id": "S1", "start_ts": 10.1, "end_ts": 14.5, "text": "Please follow up in two weeks and avoid strenuous activity."},
+    {"speaker_id": "S2", "start_ts": 14.8, "end_ts": 18.2, "text": "The ECG shows atrial fibrillation."},
+    {"speaker_id": "S1", "start_ts": 18.5, "end_ts": 22.0, "text": "We need to check the INR before starting warfarin."}
+  ],
+  "medical_terms_present": [
+    "tachycardia",
+    "troponin",
+    "metformin",
+    "diabetes mellitus",
+    "ECG",
+    "atrial fibrillation",
+    "INR",
+    "warfarin"
+  ]
+}

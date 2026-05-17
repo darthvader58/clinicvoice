@@ -22,6 +22,12 @@ from src.redact.schemas import RedactionResult, RedactionSpan, RedactionType
 
 logger = logging.getLogger(__name__)
 
+# Silence Presidio's verbose DEBUG logs — they include text positions and
+# replacement values which would leak into caplog during tests. Our own
+# `redact()` never logs PHI; this just muzzles the 3rd-party noise.
+logging.getLogger("presidio-analyzer").setLevel(logging.WARNING)
+logging.getLogger("presidio-anonymizer").setLevel(logging.WARNING)
+
 
 class RedactionEngine:
     """Lazy singleton wrapping Presidio analyzer + anonymizer."""

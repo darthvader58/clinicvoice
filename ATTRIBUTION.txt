@@ -1,0 +1,23 @@
+clinicvoice — Library Attribution
+
+openai-whisper          MIT License       https://github.com/openai/whisper
+pyannote.audio          MIT License       https://github.com/pyannote/pyannote-audio
+asteroid                MIT License       https://github.com/asteroid-team/asteroid
+noisereduce             MIT License       https://github.com/timsainburg/noisereduce
+presidio-analyzer       MIT License       https://github.com/microsoft/presidio
+presidio-anonymizer     MIT License       https://github.com/microsoft/presidio
+spaCy                   MIT License       https://github.com/explosion/spaCy
+torch / torchaudio      BSD License       https://pytorch.org
+torchmetrics            Apache 2.0        https://github.com/Lightning-AI/torchmetrics
+librosa                 ISC License       https://github.com/librosa/librosa
+soundfile               BSD License       https://github.com/bastibe/python-soundfile
+pydub                   MIT License       https://github.com/jiaaro/pydub
+langdetect              Apache 2.0        https://github.com/Mimino666/langdetect
+jiwer                   Apache 2.0        https://github.com/jitsi/jiwer
+fastapi                 MIT License       https://github.com/fastapi/fastapi
+uvicorn                 BSD License       https://github.com/encode/uvicorn
+pydantic                MIT License       https://github.com/pydantic/pydantic
+sqlalchemy              MIT License       https://github.com/sqlalchemy/sqlalchemy
+aiosqlite               MIT License       https://github.com/omnilib/aiosqlite
+silero-vad              MIT License       https://github.com/snakers4/silero-vad
+scipy                   BSD License       https://scipy.org

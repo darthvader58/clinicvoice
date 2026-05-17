@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     REPORTS_PATH: str = "data/reports"
 
     # --- ASR (whisper) ---
-    WHISPER_MODEL: str = "large-v3-turbo"
+    WHISPER_MODEL: str = "small"
     WHISPER_DEVICE: str = "cpu"
     WHISPER_LANGUAGE: Optional[str] = None  # None = auto-detect
 

@@ -65,6 +65,7 @@ class WhisperEngine:
         turn: "SpeakerTurn",
         lexicon: MedicalLexicon,
         recording_id: str,
+        language: str = "auto",
     ) -> ASRSegment:
         """Decode a single diarized turn, optionally from a separated stem."""
 
@@ -80,7 +81,7 @@ class WhisperEngine:
             stem_used = False
 
         duration = float(turn.end_ts - turn.start_ts)
-        if duration < 0.3:
+        if duration < 1.0:
             # Too short to bother with Whisper — emit a low-confidence stub.
             return ASRSegment(
                 recording_id=recording_id,
@@ -103,20 +104,56 @@ class WhisperEngine:
             mono=True,
         )
 
+        # Decide the language: explicit user hint > Whisper auto-detect.
+        # Feeding an English prompt to non-English audio forces Whisper into
+        # English or makes it parrot the prompt, so we only inject the
+        # medical lexicon prompt when the language is (or resolves to) English.
+        import whisper as _whisper  # type: ignore
+
+        detected_lang: Optional[str] = None
+        lang_prob = 1.0  # treat user-forced language as fully confident
+        if language and language != "auto":
+            detected_lang = language
+        else:
+            lang_prob = 0.0
+            try:
+                clip = _whisper.pad_or_trim(segment_audio)
+                n_mels = getattr(getattr(self._model, "dims", None), "n_mels", 80)
+                mel = _whisper.log_mel_spectrogram(clip, n_mels=n_mels).to(
+                    self._model.device
+                )
+                _, probs = self._model.detect_language(mel)
+                detected_lang = max(probs, key=probs.get)
+                lang_prob = float(probs[detected_lang])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "language_detect_failed",
+                    extra={"error_type": type(exc).__name__},
+                )
+
+        initial_prompt = (
+            lexicon.build_initial_prompt()
+            if detected_lang == "en" and lang_prob > 0.5
+            else None
+        )
+
         result = self._model.transcribe(
             segment_audio,
-            language=None,  # auto-detect
-            initial_prompt=lexicon.build_initial_prompt(),
+            language=detected_lang,
+            initial_prompt=initial_prompt,
             word_timestamps=True,
             task="transcribe",
+            no_speech_threshold=0.6,
+            compression_ratio_threshold=2.4,
+            condition_on_previous_text=False,
+            logprob_threshold=-1.0,
         )
 
         raw_text = (result.get("text") or "").strip()
         segments = result.get("segments") or []
         avg_logprob = float(segments[0].get("avg_logprob", -1.0)) if segments else -1.0
         no_speech_prob = float(segments[0].get("no_speech_prob", 1.0)) if segments else 1.0
-        whisper_lang = result.get("language")
-        lang_prob = float(result.get("language_probability", 0.0) or 0.0)
+        whisper_lang = result.get("language") or detected_lang
 
         language_tag = detect_language(raw_text, whisper_lang, lang_prob)
 
@@ -142,6 +179,7 @@ class WhisperEngine:
         diarization: "DiarizationResult",
         lexicon: MedicalLexicon,
         recording_id: str,
+        language: str = "auto",
     ) -> List[ASRSegment]:
         """Decode every speaker turn for a recording.
 
@@ -154,6 +192,8 @@ class WhisperEngine:
         for turn in diarization.turns:
             if getattr(turn, "speaker_id", None) == "OVERLAP":
                 continue
-            seg = self.transcribe_turn(normalized_audio, turn, lexicon, recording_id)
+            seg = self.transcribe_turn(
+                normalized_audio, turn, lexicon, recording_id, language=language
+            )
             segments.append(seg)
         return segments

@@ -12,7 +12,7 @@
     "potassium high", "sodium low", "creatinine rising", "deteriorating"
   ],
   "memory_triggers": [
-    "take", "prescribed", "prescription", "follow up", "return if",
+    "take", "prescribed", "prescription", "prescribing", "follow up", "return if",
     "avoid", "allergic to", "allergy", "do not", "must not",
     "referral", "specialist", "appointment", "admitted", "discharged",
     "diagnosis", "diagnosed with", "condition is", "plan is"

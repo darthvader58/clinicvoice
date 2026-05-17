@@ -135,12 +135,16 @@ async def get_db() -> AsyncSession:  # pragma: no cover - thin shim
 # ---------------------------------------------------------------------------#
 # POST /api/upload
 # ---------------------------------------------------------------------------#
+SUPPORTED_LANGUAGES = {"en", "hi", "ur", "ta", "id", "ms", "auto"}
+
+
 @router.post("/upload", response_model=UploadResponse)
 async def upload_recording(
     background_tasks: BackgroundTasks,
     request: Request,
     file: UploadFile = File(...),
     scenario: str = Form("unknown"),
+    language: str = Form("auto"),
 ) -> UploadResponse:
     """Accept an audio upload and kick off the pipeline asynchronously.
 
@@ -149,6 +153,8 @@ async def upload_recording(
     """
     if scenario not in {"hallway", "consult", "unknown"}:
         raise HTTPException(status_code=422, detail="invalid_scenario")
+    if language not in SUPPORTED_LANGUAGES:
+        raise HTTPException(status_code=422, detail="invalid_language")
 
     # Stream the upload to disk; never inspect or log its bytes.
     storage = Path(settings.AUDIO_STORAGE_PATH)
@@ -207,7 +213,7 @@ async def upload_recording(
         stage="queued",
     )
 
-    background_tasks.add_task(_run_pipeline, recording_id, dest, scenario)
+    background_tasks.add_task(_run_pipeline, recording_id, dest, scenario, language)
 
     return UploadResponse(recording_id=recording_id, status="processing", track_mode="pending")
 
@@ -215,7 +221,9 @@ async def upload_recording(
 # ---------------------------------------------------------------------------#
 # Pipeline orchestrator — runs in a BackgroundTask.
 # ---------------------------------------------------------------------------#
-async def _run_pipeline(recording_id: str, audio_path: Path, scenario: str) -> None:
+async def _run_pipeline(
+    recording_id: str, audio_path: Path, scenario: str, language: str = "auto"
+) -> None:
     """End-to-end orchestration with full PHI discipline.
 
     Steps: normalize → separate → diarize → transcribe → normalize_text →
@@ -259,6 +267,26 @@ async def _run_pipeline(recording_id: str, audio_path: Path, scenario: str) -> N
             recording_id=recording_id,
         )
 
+        # If only one speaker was diarized, ConvTasNet stems are noise/artifacts
+        # rather than real isolations. Strip stem_paths so ASR decodes the
+        # original audio — Option A still "ran" per spec, but we don't feed
+        # fabricated stems into Whisper.
+        unique_speakers = {
+            getattr(t, "speaker_id", None)
+            for t in diar.turns
+            if getattr(t, "speaker_id", None) not in (None, "OVERLAP")
+        }
+        if len(unique_speakers) <= 1 and separation is not None:
+            logger.info(
+                "skipping_stems_single_speaker",
+                extra={"recording_id_prefix": recording_id[:8]},
+            )
+            diar = diar.model_copy(
+                update={
+                    "turns": [t.model_copy(update={"stem_path": None}) for t in diar.turns]
+                }
+            )
+
         _set_progress(recording_id, stage="asr", progress=0.6)
         from src.asr.engine import WhisperEngine  # type: ignore
         from src.asr.lexicon import MedicalLexicon  # type: ignore
@@ -270,6 +298,7 @@ async def _run_pipeline(recording_id: str, audio_path: Path, scenario: str) -> N
             diarization=diar,
             lexicon=lexicon,
             recording_id=recording_id,
+            language=language,
         )
 
         # Per-segment: normalize → redact → escalate → persist.
@@ -395,11 +424,31 @@ async def _run_pipeline(recording_id: str, audio_path: Path, scenario: str) -> N
                 rec.speaker_count = len({s.speaker_id for s in asr_segments})
             await session.commit()
 
-        # Metrics — optional and synthetic-only in the live pipeline.
+        # Metrics — persist what we can compute without ground truth.
+        # WER / MTER / DER need a reference transcript; for a live recording
+        # we only have SI-SDR + counts. The benchmark script fills in the
+        # ground-truth-based numbers separately.
         try:
-            from src.metrics.report import MetricsReporter  # type: ignore
+            from datetime import datetime, timezone
 
-            await MetricsReporter().run_for_recording(recording_id)
+            from src.db.models import MetricsRun
+
+            async with AsyncSessionLocal() as session:
+                session.add(
+                    MetricsRun(
+                        recording_id=recording_id,
+                        wer=None,
+                        medical_ter=None,
+                        der_proxy=None,
+                        si_sdr=si_sdr,
+                        speaker_count=len(unique_speakers),
+                        segment_count=len(asr_segments),
+                        track_mode=track_mode,
+                        run_at=datetime.now(timezone.utc).isoformat(),
+                        report_path=None,
+                    )
+                )
+                await session.commit()
         except Exception as exc:
             logger.info(
                 "metrics_skipped",

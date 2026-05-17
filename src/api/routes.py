@@ -232,7 +232,9 @@ async def _run_pipeline(recording_id: str, audio_path: Path, scenario: str) -> N
         try:
             from src.ingest.separator import separate_speakers  # type: ignore
 
-            separation = await separate_speakers(normalized)
+            separation = await separate_speakers(
+                normalized, settings, Path(settings.AUDIO_STORAGE_PATH)
+            )
             track_mode = separation.track_mode
             si_sdr = separation.si_sdr_max
         except Exception as exc:
@@ -247,31 +249,41 @@ async def _run_pipeline(recording_id: str, audio_path: Path, scenario: str) -> N
         _set_progress(recording_id, track_mode=track_mode, si_sdr=si_sdr)
 
         _set_progress(recording_id, stage="diarize", progress=0.45)
-        from src.diarize.engine import DiarizationEngine  # type: ignore
+        from src.diarize.engine import diarize_audio  # type: ignore
 
-        diar = await DiarizationEngine().diarize(normalized)
+        diar = await diarize_audio(
+            audio_path=normalized.path,
+            separation=separation,
+            max_speakers=settings.MAX_SPEAKERS,
+            settings=settings,
+            recording_id=recording_id,
+        )
 
         _set_progress(recording_id, stage="asr", progress=0.6)
         from src.asr.engine import WhisperEngine  # type: ignore
+        from src.asr.lexicon import MedicalLexicon  # type: ignore
 
-        whisper = WhisperEngine()
+        whisper = WhisperEngine(settings)
+        lexicon = MedicalLexicon.load(settings.MEDICAL_LEXICON_PATH)
         asr_segments = await whisper.transcribe_recording(
-            normalized=normalized,
+            normalized_audio=normalized,
             diarization=diar,
-            separation=separation,
+            lexicon=lexicon,
             recording_id=recording_id,
         )
 
         # Per-segment: normalize → redact → escalate → persist.
         _set_progress(recording_id, stage="postprocess", progress=0.75)
-        from src.normalize.confidence import score_confidence  # type: ignore
+        from src.normalize.confidence import compute_confidence  # type: ignore
         from src.redact.engine import redact  # type: ignore
 
         # Escalation is optional in early test runs.
         try:
             from src.escalation.engine import EscalationEngine  # type: ignore
 
-            escalation = EscalationEngine()
+            escalation = EscalationEngine(
+                watchlist_path=Path("src/escalation/watchlist.json")
+            )
         except Exception:
             escalation = None
 
@@ -308,15 +320,20 @@ async def _run_pipeline(recording_id: str, audio_path: Path, scenario: str) -> N
 
                 # Confidence (all languages).
                 try:
-                    conf = score_confidence(asr)
+                    conf = compute_confidence(
+                        whisper_avg_logprob=asr.whisper_avg_logprob,
+                        no_speech_prob=asr.no_speech_prob,
+                        overlap=bool(getattr(asr, "overlap_flag", False)),
+                        segment_duration=asr.end_ts - asr.start_ts,
+                        stem_used=asr.stem_used,
+                    )
                 except Exception:
                     conf = asr.confidence
 
                 # ⚠ REDACTION BOUNDARY ⚠ — raw_text dies here.
-                redaction = redact(text, lang)
-                redacted_text = redaction.redacted_text
+                redacted_text, redaction_map = redact(text, lang)
                 redaction_map_json = json.dumps(
-                    [span.model_dump() for span in redaction.redaction_map]
+                    [span.model_dump() for span in redaction_map]
                 )
 
                 segment = Segment(

@@ -105,7 +105,7 @@ app.add_middleware(
 try:  # pragma: no cover — depends on agent ZETA completion
     from src.api.routes import router as api_router
 
-    app.include_router(api_router, prefix="/api")
+    app.include_router(api_router)
     logger.info("api_router_mounted")
 except Exception as err:  # noqa: BLE001 — boot must not fail before routes exist
     logger.warning(

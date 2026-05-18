@@ -46,6 +46,41 @@ export const api = {
   },
 
   /**
+   * Start a live streaming session.
+   * @returns {Promise<{recording_id: string, status: string}>}
+   */
+  streamStart(scenario = 'unknown', language = 'auto') {
+    const fd = new FormData()
+    fd.append('scenario', scenario)
+    fd.append('language', language)
+    return fetch(`${BASE}/stream/start`, { method: 'POST', body: fd }).then(asJson)
+  },
+
+  /**
+   * POST one chunk of audio for live transcription.
+   * @returns {Promise<{recording_id: string, seq: number, redacted_text: string, language_tag: string, redaction_count: number, duration_s: number}>}
+   */
+  streamChunk(recordingId, blob, filename = 'chunk.webm') {
+    const fd = new FormData()
+    fd.append('file', blob, filename)
+    return fetch(
+      `${BASE}/stream/${encodeURIComponent(recordingId)}/chunk`,
+      { method: 'POST', body: fd },
+    ).then(asJson)
+  },
+
+  /**
+   * Stop a live session and trigger consolidation pass.
+   * @returns {Promise<{recording_id: string, status: string, chunks: number}>}
+   */
+  streamStop(recordingId) {
+    return fetch(
+      `${BASE}/stream/${encodeURIComponent(recordingId)}/stop`,
+      { method: 'POST' },
+    ).then(asJson)
+  },
+
+  /**
    * Poll pipeline status.
    * @returns {Promise<{status: string, progress?: number, track_mode?: string, si_sdr?: number}>}
    */

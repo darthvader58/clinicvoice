@@ -20,6 +20,8 @@ const state = {
   recordingId: null,
   activeTab: 'transcript',
   transcriptData: null,
+  liveSegments: [],
+  liveCursorTs: 0,
 }
 
 function $(sel, root = document) {
@@ -176,6 +178,82 @@ async function handleUpload({ result }, components) {
   }
 }
 
+function renderLiveTranscript(components) {
+  const payload = {
+    recording_id: state.recordingId,
+    track_mode: 'live',
+    si_sdr: null,
+    segments: state.liveSegments,
+  }
+  state.transcriptData = payload
+  components.transcriptViewer.setData(payload)
+  components.speakerTimeline.setData({
+    segments: state.liveSegments,
+    track_mode: 'live',
+  })
+}
+
+function handleLiveStart({ recording_id, language }, components) {
+  state.recordingId = recording_id
+  state.liveSegments = []
+  state.liveCursorTs = 0
+  setText('[data-role="recording-id"]', `recording_id: ${recording_id}`)
+  components.trackIndicator.set({ track_mode: 'live', si_sdr: null })
+  renderLiveTranscript(components)
+  showBanner(`Live session started (${language}). Speak into the mic.`, 'info', 4000)
+}
+
+function handleLiveChunk(chunk, components) {
+  if (!chunk || chunk.recording_id !== state.recordingId) return
+  const start = state.liveCursorTs
+  const end = start + (chunk.duration_s || 0)
+  state.liveCursorTs = end
+  state.liveSegments = [
+    ...state.liveSegments,
+    {
+      segment_id: `live-${chunk.seq}`,
+      speaker_id: 'LIVE',
+      start_ts: start,
+      end_ts: end,
+      confidence: 'med',
+      language_tag: chunk.language_tag || 'unknown',
+      overlap_flag: false,
+      stem_used: false,
+      redacted_text: chunk.redacted_text || '',
+      redaction_map: [],
+    },
+  ]
+  renderLiveTranscript(components)
+}
+
+async function handleLiveStop({ recording_id, chunks }, components) {
+  showBanner(
+    `Consolidating ${chunks} chunks into final transcript…`,
+    'info',
+  )
+  try {
+    await pollStatus(recording_id, {
+      intervalMs: 1500,
+      timeoutMs: 600000,
+      onTick(s) {
+        if (s.track_mode || s.si_sdr != null) {
+          components.trackIndicator.set({
+            track_mode: s.track_mode,
+            si_sdr: s.si_sdr,
+          })
+        }
+        const pct = s.progress != null ? ` ${(s.progress * 100).toFixed(0)}%` : ''
+        showBanner(`consolidation: ${s.status}${pct}`, 'info')
+      },
+    })
+    await loadAllForRecording(recording_id, components)
+    showBanner('Final transcript ready.', 'success', 3000)
+  } catch (err) {
+    console.warn('[live-consolidate]', err)
+    showBanner(`Consolidation failed: ${err.message}`, 'error', 6000)
+  }
+}
+
 async function loadAllForRecording(recordingId, components) {
   const [transcript, metrics, escalation] = await Promise.allSettled([
     api.transcript(recordingId),
@@ -257,6 +335,15 @@ function bootstrap() {
   const recorder = createRecorder({
     onUpload(payload) {
       handleUpload(payload, components)
+    },
+    onLiveStart(payload) {
+      handleLiveStart(payload, components)
+    },
+    onLiveChunk(payload) {
+      handleLiveChunk(payload, components)
+    },
+    onLiveStop(payload) {
+      handleLiveStop(payload, components)
     },
     onError(err) {
       console.warn('[recorder]', err)

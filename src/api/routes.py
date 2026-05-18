@@ -390,12 +390,14 @@ async def _run_pipeline(
                 # Escalation runs only on non-low confidence — engine enforces, too.
                 if escalation is not None:
                     try:
-                        events = escalation.process_segment(
+                        events, _memory, _handoff = escalation.process_segment(
                             segment_id=segment.id,
                             recording_id=recording_id,
                             speaker_id=asr.speaker_id,
                             redacted_text=redacted_text,
                             confidence=conf,
+                            scenario=scenario,
+                            start_ts=asr.start_ts,
                         )
                         for evt in events or []:
                             session.add(

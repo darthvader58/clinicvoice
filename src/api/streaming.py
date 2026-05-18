@@ -58,6 +58,30 @@ class StartResponse(BaseModel):
     status: str = "live"
 
 
+class EscalationEventOut(BaseModel):
+    event_type: str
+    watchlist_term: str
+    speaker_id: str
+    confidence: str
+
+
+class MemoryCandidateOut(BaseModel):
+    segment_id: str
+    speaker_id: str
+    redacted_text: str
+    language_tag: str
+    confidence: str
+    category: str
+
+
+class HandoffNoteOut(BaseModel):
+    from_speaker: str
+    redacted_instruction: str
+    start_ts: float
+    confidence: str
+    watchlist_term: str
+
+
 class ChunkResponse(BaseModel):
     recording_id: str
     seq: int
@@ -69,6 +93,9 @@ class ChunkResponse(BaseModel):
     redaction_count: int
     duration_s: float
     dropped: bool = False  # True when silent or low-conf detection muted this chunk
+    escalations: List[EscalationEventOut] = []
+    memory_candidate: Optional[MemoryCandidateOut] = None
+    handoff_note: Optional[HandoffNoteOut] = None
 
 
 class StopResponse(BaseModel):
@@ -240,14 +267,26 @@ async def post_chunk(
     start_ts = sess["ts_cursor"]
     end_ts = start_ts + duration_s
     sess["ts_cursor"] = end_ts
+    out_events: list[EscalationEventOut] = []
+    out_memory: Optional[MemoryCandidateOut] = None
+    out_handoff: Optional[HandoffNoteOut] = None
     if not dropped and redacted_text:
-        await _persist_live_segment(
+        segment_id = await _persist_live_segment(
             recording_id=recording_id,
             start_ts=start_ts,
             end_ts=end_ts,
             language_tag=language_tag,
             redacted_text=redacted_text,
         )
+        if segment_id is not None:
+            out_events, out_memory, out_handoff = await _process_live_escalation(
+                recording_id=recording_id,
+                segment_id=segment_id,
+                redacted_text=redacted_text,
+                confidence="med",
+                scenario=sess["scenario"],
+                start_ts=start_ts,
+            )
 
     logger.info(
         "live_chunk_decoded",
@@ -273,6 +312,9 @@ async def post_chunk(
         redaction_count=redaction_count,
         duration_s=duration_s,
         dropped=dropped,
+        escalations=out_events,
+        memory_candidate=out_memory,
+        handoff_note=out_handoff,
     )
 
 
@@ -436,17 +478,20 @@ async def _persist_live_segment(
     end_ts: float,
     language_tag: str,
     redacted_text: str,
-) -> None:
+) -> Optional[str]:
+    """Persist a live chunk's segment + transcript. Returns the segment_id
+    on success so downstream escalation processing can reference it."""
     import json as _json
     from uuid import uuid4
 
     from src.db.models import Segment, TranscriptSpan  # type: ignore
     from src.db.session import AsyncSessionLocal  # type: ignore
 
+    segment_id = str(uuid4())
     try:
         async with AsyncSessionLocal() as session:
             seg = Segment(
-                id=str(uuid4()),
+                id=segment_id,
                 recording_id=recording_id,
                 speaker_id="S1",
                 start_ts=float(start_ts),
@@ -473,6 +518,148 @@ async def _persist_live_segment(
                 "error_type": type(exc).__name__,
             },
         )
+        return None
+    return segment_id
+
+
+# Module-level escalation singleton — watchlist is small JSON, load once.
+_ESCALATION_ENGINE: Any = None
+_ESCALATION_ENGINE_LOAD_FAILED: bool = False
+
+
+def _get_escalation_engine() -> Any:
+    """Return a process-wide EscalationEngine, or None if it can't load.
+
+    The engine is stateless; one instance can serve every live session.
+    """
+    global _ESCALATION_ENGINE, _ESCALATION_ENGINE_LOAD_FAILED
+    if _ESCALATION_ENGINE is not None:
+        return _ESCALATION_ENGINE
+    if _ESCALATION_ENGINE_LOAD_FAILED:
+        return None
+    try:
+        from src.escalation.engine import EscalationEngine  # type: ignore
+
+        _ESCALATION_ENGINE = EscalationEngine(
+            watchlist_path=Path("src/escalation/watchlist.json")
+        )
+    except Exception as exc:  # noqa: BLE001
+        _ESCALATION_ENGINE_LOAD_FAILED = True
+        logger.warning(
+            "escalation_engine_unavailable",
+            extra={"error_type": type(exc).__name__},
+        )
+        return None
+    return _ESCALATION_ENGINE
+
+
+async def _process_live_escalation(
+    *,
+    recording_id: str,
+    segment_id: str,
+    redacted_text: str,
+    confidence: str,
+    scenario: str,
+    start_ts: float,
+) -> tuple[
+    list[EscalationEventOut],
+    Optional[MemoryCandidateOut],
+    Optional[HandoffNoteOut],
+]:
+    """Run the escalation engine for a freshly persisted live segment.
+
+    Persists EscalationEvent rows and returns lightweight DTOs for the API
+    response. Returns empty tuple when engine unavailable or input low-conf.
+    """
+    engine = _get_escalation_engine()
+    if engine is None:
+        return [], None, None
+
+    try:
+        events, memory_candidate, handoff_note = await asyncio.to_thread(
+            engine.process_segment,
+            segment_id=segment_id,
+            recording_id=recording_id,
+            redacted_text=redacted_text,
+            speaker_id="S1",
+            confidence=confidence,
+            scenario=scenario,
+            start_ts=start_ts,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "live_escalation_failed",
+            extra={
+                "recording_id_prefix": recording_id[:8],
+                "error_type": type(exc).__name__,
+            },
+        )
+        return [], None, None
+
+    if not events and memory_candidate is None and handoff_note is None:
+        return [], None, None
+
+    # Persist EscalationEvent rows so /api/escalation can serve them later.
+    if events:
+        try:
+            from src.db.models import EscalationEvent  # type: ignore
+            from src.db.session import AsyncSessionLocal  # type: ignore
+
+            async with AsyncSessionLocal() as session:
+                for evt in events:
+                    session.add(
+                        EscalationEvent(
+                            recording_id=recording_id,
+                            segment_id=segment_id,
+                            event_type=evt.event_type,
+                            watchlist_term=evt.watchlist_term,
+                            speaker_id=evt.speaker_id,
+                            confidence=evt.confidence,
+                        )
+                    )
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "live_escalation_persist_failed",
+                extra={
+                    "recording_id_prefix": recording_id[:8],
+                    "error_type": type(exc).__name__,
+                },
+            )
+
+    out_events = [
+        EscalationEventOut(
+            event_type=e.event_type,
+            watchlist_term=e.watchlist_term,
+            speaker_id=e.speaker_id,
+            confidence=e.confidence,
+        )
+        for e in events
+    ]
+    out_memory = (
+        MemoryCandidateOut(
+            segment_id=memory_candidate.segment_id,
+            speaker_id=memory_candidate.speaker_id,
+            redacted_text=memory_candidate.redacted_text,
+            language_tag=memory_candidate.language_tag,
+            confidence=memory_candidate.confidence,
+            category=memory_candidate.category,
+        )
+        if memory_candidate is not None
+        else None
+    )
+    out_handoff = (
+        HandoffNoteOut(
+            from_speaker=handoff_note.from_speaker,
+            redacted_instruction=handoff_note.redacted_instruction,
+            start_ts=handoff_note.start_ts,
+            confidence=handoff_note.confidence,
+            watchlist_term=handoff_note.watchlist_term,
+        )
+        if handoff_note is not None
+        else None
+    )
+    return out_events, out_memory, out_handoff
 
 
 # --------------------------------------------------------------------------- #

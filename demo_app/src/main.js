@@ -208,6 +208,11 @@ function handleLiveChunk(chunk, components) {
   const start = state.liveCursorTs
   const end = start + (chunk.duration_s || 0)
   state.liveCursorTs = end
+  // Skip chunks the backend dropped for low-confidence detection — they'd
+  // render as empty segments and clutter the ticker.
+  if (chunk.dropped) {
+    return
+  }
   state.liveSegments = [
     ...state.liveSegments,
     {
@@ -220,6 +225,7 @@ function handleLiveChunk(chunk, components) {
       overlap_flag: false,
       stem_used: false,
       redacted_text: chunk.redacted_text || '',
+      redacted_text_roman: chunk.redacted_text_roman || null,
       redaction_map: [],
     },
   ]

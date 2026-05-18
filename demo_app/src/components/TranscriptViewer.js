@@ -97,7 +97,10 @@ export function createTranscriptViewer({ onSelectSegment, onCorrection } = {}) {
     const lang = escapeHtml(seg.language_tag || 'unknown')
     const start = fmtTs(seg.start_ts ?? seg.start)
     const end = fmtTs(seg.end_ts ?? seg.end)
-    const text = seg.redacted_text || seg.text || ''
+    // Prefer the romanized version for display when present (non-English).
+    // The canonical seg.redacted_text remains in the original script in the
+    // DB and the API response for downstream consumers.
+    const text = seg.redacted_text_roman || seg.redacted_text || seg.text || ''
     const stemBadge = seg.stem_used
       ? '<span class="badge badge-stem mono" title="Decoded from Option A stem">&#x26A1; Stem</span>'
       : ''

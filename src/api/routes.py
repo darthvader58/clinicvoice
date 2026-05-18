@@ -538,6 +538,7 @@ async def get_transcript(recording_id: str) -> TranscriptResponse:
         rows = (await session.execute(stmt)).all()
 
         from src.normalize.romanize import to_roman
+        from src.redact.engine import redact as _redact
 
         segs: list[TranscriptSegmentOut] = []
         for seg, span in rows:
@@ -545,6 +546,27 @@ async def get_transcript(recording_id: str) -> TranscriptResponse:
                 redaction_map = json.loads(span.redaction_map) if span.redaction_map else []
             except Exception:
                 redaction_map = []
+
+            redacted_roman = to_roman(span.redacted_text, seg.language_tag)
+            # Dual-pass: the stored redacted_text was produced with the
+            # segment's language, which means Presidio NER ran only for EN.
+            # For non-EN segments we re-run the EN-NER pass over the
+            # romanized text so names and Latin-script PHI get caught for
+            # the displayed transcript. Digit-run collapse first so phone
+            # numbers spoken digit-by-digit ("9 6 5 9 2 9") become a single
+            # token the recognizers can match.
+            if redacted_roman and seg.language_tag != "en":
+                try:
+                    from src.normalize.digits import collapse_digit_runs
+
+                    extra_redacted, extra_map = _redact(
+                        collapse_digit_runs(redacted_roman), "en"
+                    )
+                    if extra_map:
+                        redacted_roman = extra_redacted
+                except Exception:
+                    pass
+
             segs.append(
                 TranscriptSegmentOut(
                     segment_id=seg.id,
@@ -556,7 +578,7 @@ async def get_transcript(recording_id: str) -> TranscriptResponse:
                     overlap_flag=bool(seg.overlap_flag),
                     stem_used=bool(seg.stem_used),
                     redacted_text=span.redacted_text,
-                    redacted_text_roman=to_roman(span.redacted_text, seg.language_tag),
+                    redacted_text_roman=redacted_roman,
                     redaction_map=redaction_map,
                 )
             )

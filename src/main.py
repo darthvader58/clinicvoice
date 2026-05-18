@@ -54,6 +54,31 @@ def _strip_phi(text: str) -> str:
 # --------------------------------------------------------------------------- #
 # Lifespan: init DB, start retention loop, ensure storage dirs exist.
 # --------------------------------------------------------------------------- #
+async def _warmup_models() -> None:
+    """Preload Whisper + Presidio so the first /chunk upload doesn't pay the
+    1-2 minute model-load cost. Runs as a background task, not awaited at
+    startup, so the API is reachable immediately."""
+    try:
+        from src.asr.engine import WhisperEngine
+
+        await asyncio.to_thread(WhisperEngine.get_instance, settings)
+        logger.info("whisper_warmup_complete", extra={"model": settings.WHISPER_MODEL})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "whisper_warmup_failed", extra={"error_type": type(exc).__name__}
+        )
+
+    try:
+        from src.redact.engine import RedactionEngine
+
+        await asyncio.to_thread(RedactionEngine.get_instance)
+        logger.info("presidio_warmup_complete")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "presidio_warmup_failed", extra={"error_type": type(exc).__name__}
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Ensure local storage roots exist before anything writes to them.
@@ -64,6 +89,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("db_ready", extra={"db_path": settings.DB_PATH})
 
     retention_task = asyncio.create_task(retention_loop(settings), name="retention_loop")
+    warmup_task = asyncio.create_task(_warmup_models(), name="warmup_models")
+    app.state.warmup_task = warmup_task
     logger.info("startup_complete")
 
     try:
@@ -74,6 +101,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await retention_task
         except asyncio.CancelledError:
             pass
+        # Warmup may still be in flight on shutdown; cancel cleanly.
+        if not warmup_task.done():
+            warmup_task.cancel()
+            try:
+                await warmup_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         logger.info("shutdown_complete")
 
 
@@ -110,6 +144,17 @@ try:  # pragma: no cover — depends on agent ZETA completion
 except Exception as err:  # noqa: BLE001 — boot must not fail before routes exist
     logger.warning(
         "api_router_unavailable",
+        extra={"error": err.__class__.__name__},
+    )
+
+try:
+    from src.api.streaming import router as streaming_router
+
+    app.include_router(streaming_router)
+    logger.info("streaming_router_mounted")
+except Exception as err:  # noqa: BLE001
+    logger.warning(
+        "streaming_router_unavailable",
         extra={"error": err.__class__.__name__},
     )
 

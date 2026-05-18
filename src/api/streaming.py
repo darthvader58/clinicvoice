@@ -33,6 +33,12 @@ router = APIRouter(prefix="/api/stream")
 
 SUPPORTED_LANGUAGES = {"en", "hi", "ur", "ta", "id", "ms", "auto"}
 
+# Auto-detect thresholds. < DROP -> chunk emits empty text (likely silence
+# or undetectable noise). > LOCK -> language is fixed for the rest of the
+# session, suppressing detection drift across short chunks.
+LANG_DROP_THRESHOLD = 0.5
+LANG_LOCK_THRESHOLD = 0.7
+
 # In-process registry of live sessions, keyed by recording_id.
 _LIVE: Dict[str, Dict[str, Any]] = {}
 
@@ -56,9 +62,11 @@ class ChunkResponse(BaseModel):
     recording_id: str
     seq: int
     redacted_text: str
+    redacted_text_roman: Optional[str] = None
     language_tag: str
     redaction_count: int
     duration_s: float
+    dropped: bool = False  # True when low-conf detection muted this chunk
 
 
 class StopResponse(BaseModel):
@@ -110,6 +118,7 @@ async def start_session(
     _LIVE[recording_id] = {
         "scenario": scenario,
         "language": language,
+        "locked_language": None,  # set after first confident auto-detection
         "next_seq": 0,
         "chunks_dir": chunks_dir,
         "lock": asyncio.Lock(),
@@ -150,15 +159,25 @@ async def post_chunk(
         chunk_path.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail="empty_chunk")
 
+    # User-forced language always wins; otherwise reuse the locked language
+    # from the first confident detection in this session.
+    effective_language = sess["language"]
+    if effective_language == "auto" and sess.get("locked_language"):
+        effective_language = sess["locked_language"]
+
     # openai-whisper is not thread-safe; serialize per session.
     async with sess["lock"]:
         try:
-            redacted_text, redaction_count, language_tag, duration_s = (
-                await asyncio.to_thread(
-                    _decode_chunk_sync,
-                    chunk_path,
-                    sess["language"],
-                )
+            (
+                redacted_text,
+                redacted_text_roman,
+                redaction_count,
+                language_tag,
+                duration_s,
+                dropped,
+                lock_now,
+            ) = await asyncio.to_thread(
+                _decode_chunk_sync, chunk_path, effective_language
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception(
@@ -171,6 +190,16 @@ async def post_chunk(
             )
             raise HTTPException(status_code=500, detail="chunk_decode_failed")
 
+        if lock_now and sess.get("locked_language") is None:
+            sess["locked_language"] = language_tag
+            logger.info(
+                "live_language_locked",
+                extra={
+                    "recording_id_prefix": recording_id[:8],
+                    "language_tag": language_tag,
+                },
+            )
+
     logger.info(
         "live_chunk_decoded",
         extra={
@@ -179,15 +208,18 @@ async def post_chunk(
             "duration_s": round(duration_s, 2),
             "language_tag": language_tag,
             "redaction_count": redaction_count,
+            "dropped": dropped,
         },
     )
     return ChunkResponse(
         recording_id=recording_id,
         seq=seq,
         redacted_text=redacted_text,
+        redacted_text_roman=redacted_text_roman,
         language_tag=language_tag,
         redaction_count=redaction_count,
         duration_s=duration_s,
+        dropped=dropped,
     )
 
 
@@ -219,15 +251,33 @@ async def stop_session(
 # --------------------------------------------------------------------------- #
 def _decode_chunk_sync(
     chunk_path: Path, language: str
-) -> tuple[str, int, str, float]:
-    """Decode a single chunk: ffmpeg/librosa -> Whisper -> redact.
+) -> tuple[str, Optional[str], int, str, float, bool, bool]:
+    """Decode a single chunk: ffmpeg/librosa -> Whisper -> redact -> romanize.
 
-    Returns (redacted_text, redaction_count, language_tag_str, duration_s).
+    Returns
+    -------
+    redacted_text : str
+        Canonical redacted text in the detected script (may be empty when
+        the chunk was dropped for low confidence).
+    redacted_text_roman : str | None
+        Latin/ASCII transliteration for UI display; None for English /
+        already-Latin scripts and for dropped chunks.
+    redaction_count : int
+        Number of PHI spans redacted.
+    language_tag : str
+        ISO code of the resolved language ("en", "hi", ...) or "unknown".
+    duration_s : float
+        Audio duration of this chunk.
+    dropped : bool
+        True if low-confidence auto-detect muted this chunk.
+    lock_now : bool
+        True if the caller should lock this language for the session.
     """
     import librosa  # type: ignore
     import whisper as _whisper  # type: ignore
 
     from src.asr.engine import WhisperEngine
+    from src.normalize.romanize import to_roman
     from src.redact.engine import redact
 
     audio, _sr = librosa.load(str(chunk_path), sr=16000, mono=True)
@@ -238,7 +288,8 @@ def _decode_chunk_sync(
 
     detected_lang: Optional[str] = None
     lang_prob = 1.0
-    if language and language != "auto":
+    user_forced = bool(language) and language != "auto"
+    if user_forced:
         detected_lang = language
     else:
         lang_prob = 0.0
@@ -255,6 +306,11 @@ def _decode_chunk_sync(
                 extra={"error_type": type(exc).__name__},
             )
 
+        # Drop chunk if detection is too uncertain — better empty than
+        # hallucinated Polish/Russian on a Hindi clip.
+        if lang_prob < LANG_DROP_THRESHOLD:
+            return "", None, 0, detected_lang or "unknown", duration_s, True, False
+
     result = model.transcribe(
         audio,
         language=detected_lang,
@@ -270,10 +326,19 @@ def _decode_chunk_sync(
     lang_tag = detected_lang or "unknown"
 
     # === REDACTION BOUNDARY === raw_text dies here.
-    redacted_text, redaction_map = redact(raw_text, lang_tag if lang_tag in {
-        "en", "hi", "ur", "ta", "id", "ms"
-    } else "en")
-    return redacted_text, len(redaction_map), lang_tag, duration_s
+    redact_lang = lang_tag if lang_tag in {"en", "hi", "ur", "ta", "id", "ms"} else "en"
+    redacted_text, redaction_map = redact(raw_text, redact_lang)
+    redacted_roman = to_roman(redacted_text, lang_tag)
+    lock_now = (not user_forced) and lang_prob >= LANG_LOCK_THRESHOLD
+    return (
+        redacted_text,
+        redacted_roman,
+        len(redaction_map),
+        lang_tag,
+        duration_s,
+        False,
+        lock_now,
+    )
 
 
 # --------------------------------------------------------------------------- #

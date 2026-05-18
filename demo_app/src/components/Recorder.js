@@ -287,8 +287,28 @@ export function createRecorder({
       const ext = (state.liveMime.split('/')[1] || 'webm').split(';')[0]
       const filename = `chunk-${Date.now()}.${ext}`
       try {
-        const resp = await api.streamChunk(state.liveRecordingId, blob, filename)
+        const resp = await api.streamChunk(
+          state.liveRecordingId,
+          blob,
+          filename,
+          state.language,
+        )
         state.liveSeq = (resp.seq ?? state.liveSeq) + 1
+        // Reflect effective language in the recorder status so the user can
+        // see what each chunk was actually decoded as (and whether auto
+        // locked to a wrong language).
+        const lockSuffix =
+          resp.language_source === 'locked'
+            ? ' (locked)'
+            : resp.language_source === 'silence'
+              ? ' (silence)'
+              : resp.language_source === 'detected'
+                ? ' (detected)'
+                : ''
+        setStatus(
+          `Live — lang: ${resp.language_tag}${lockSuffix}`,
+          'recording',
+        )
         if (onLiveChunk) onLiveChunk(resp)
       } catch (err) {
         reportError(err)

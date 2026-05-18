@@ -57,6 +57,7 @@ export function createTranscriptViewer({ onSelectSegment, onCorrection } = {}) {
     root.innerHTML = `
       <header class="card-header">
         <h2>Transcript</h2>
+        <span class="badge badge-muted mono" data-role="langs" hidden></span>
         <span class="badge badge-muted mono" data-role="count">0 segments</span>
       </header>
       <div class="transcript-list" data-role="list" role="list"></div>
@@ -86,6 +87,24 @@ export function createTranscriptViewer({ onSelectSegment, onCorrection } = {}) {
   function paint() {
     if (!data.segments?.length) return paintEmpty()
     root.querySelector('[data-role="count"]').textContent = `${data.segments.length} segment${data.segments.length === 1 ? '' : 's'}`
+
+    // Surface the unique languages detected across all segments, so the user
+    // can see what auto-detect picked (or where it drifted).
+    const langs = Array.from(
+      new Set(
+        data.segments
+          .map((s) => s.language_tag)
+          .filter((l) => l && l !== 'unknown'),
+      ),
+    )
+    const langsEl = root.querySelector('[data-role="langs"]')
+    if (langs.length) {
+      langsEl.textContent = `lang${langs.length === 1 ? '' : 's'}: ${langs.join(', ')}`
+      langsEl.hidden = false
+    } else {
+      langsEl.hidden = true
+    }
+
     listEl.innerHTML = data.segments.map(renderSegment).join('')
     bindSegmentEvents()
   }

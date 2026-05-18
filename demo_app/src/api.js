@@ -58,11 +58,13 @@ export const api = {
 
   /**
    * POST one chunk of audio for live transcription.
-   * @returns {Promise<{recording_id: string, seq: number, redacted_text: string, language_tag: string, redaction_count: number, duration_s: number}>}
+   * Passing `language` updates the session's user-language hint and clears
+   * any sticky-locked language so a mid-recording dropdown change takes effect.
    */
-  streamChunk(recordingId, blob, filename = 'chunk.webm') {
+  streamChunk(recordingId, blob, filename = 'chunk.webm', language = null) {
     const fd = new FormData()
     fd.append('file', blob, filename)
+    if (language) fd.append('language', language)
     return fetch(
       `${BASE}/stream/${encodeURIComponent(recordingId)}/chunk`,
       { method: 'POST', body: fd },

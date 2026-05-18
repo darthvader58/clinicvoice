@@ -22,6 +22,7 @@ const state = {
   transcriptData: null,
   liveSegments: [],
   liveCursorTs: 0,
+  liveEscalation: { events: [], memory_candidates: [], handoff_notes: [] },
 }
 
 function $(sel, root = document) {
@@ -197,9 +198,11 @@ function handleLiveStart({ recording_id, language }, components) {
   state.recordingId = recording_id
   state.liveSegments = []
   state.liveCursorTs = 0
+  state.liveEscalation = { events: [], memory_candidates: [], handoff_notes: [] }
   setText('[data-role="recording-id"]', `recording_id: ${recording_id}`)
   components.trackIndicator.set({ track_mode: 'live', si_sdr: null })
   renderLiveTranscript(components)
+  components.escalationPanel.setData(state.liveEscalation)
   showBanner(`Live session started (${language}). Speak into the mic.`, 'info', 4000)
 }
 
@@ -230,6 +233,28 @@ function handleLiveChunk(chunk, components) {
     },
   ]
   renderLiveTranscript(components)
+
+  // Append any escalation signals from this chunk to the cumulative session
+  // state and re-render the panel. The panel's setData() replaces the full
+  // payload so we always send the accumulated arrays.
+  const newEvents = chunk.escalations || []
+  const newMemory = chunk.memory_candidate ? [chunk.memory_candidate] : []
+  const newHandoff = chunk.handoff_note ? [chunk.handoff_note] : []
+  if (newEvents.length || newMemory.length || newHandoff.length) {
+    state.liveEscalation = {
+      events: [...state.liveEscalation.events, ...newEvents],
+      memory_candidates: [...state.liveEscalation.memory_candidates, ...newMemory],
+      handoff_notes: [...state.liveEscalation.handoff_notes, ...newHandoff],
+    }
+    components.escalationPanel.setData(state.liveEscalation)
+
+    // Surface high-acuity alerts as a banner so the clinician sees them
+    // even if the Escalation tab isn't focused.
+    const high = newEvents.find((e) => e.event_type === 'escalation_high')
+    if (high) {
+      showBanner(`⚠ High-acuity term detected: ${high.watchlist_term}`, 'error', 6000)
+    }
+  }
 }
 
 async function handleLiveStop({ recording_id, chunks }, components) {

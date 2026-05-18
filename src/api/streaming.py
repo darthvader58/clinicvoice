@@ -64,9 +64,11 @@ class ChunkResponse(BaseModel):
     redacted_text: str
     redacted_text_roman: Optional[str] = None
     language_tag: str
+    language_locked: bool = False  # True if session is now sticky-locked to this lang
+    language_source: str = "auto"  # "user" | "locked" | "detected" | "silence"
     redaction_count: int
     duration_s: float
-    dropped: bool = False  # True when low-conf detection muted this chunk
+    dropped: bool = False  # True when silent or low-conf detection muted this chunk
 
 
 class StopResponse(BaseModel):
@@ -123,6 +125,9 @@ async def start_session(
         "chunks_dir": chunks_dir,
         "lock": asyncio.Lock(),
         "started_at": datetime.now(timezone.utc).isoformat(),
+        # Running cursor over the session's audio timeline. Each persisted
+        # Segment uses this as its start_ts and bumps by the chunk's duration.
+        "ts_cursor": 0.0,
     }
     logger.info(
         "live_session_started",
@@ -138,10 +143,25 @@ async def start_session(
 async def post_chunk(
     recording_id: str,
     file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
 ) -> ChunkResponse:
     sess = _session(recording_id)
     seq = sess["next_seq"]
     sess["next_seq"] = seq + 1
+
+    # Mid-session language change from the UI clears the sticky lock and
+    # updates the session's user-language hint.
+    if language is not None and language in SUPPORTED_LANGUAGES and language != sess["language"]:
+        logger.info(
+            "live_language_changed",
+            extra={
+                "recording_id_prefix": recording_id[:8],
+                "old": sess["language"],
+                "new": language,
+            },
+        )
+        sess["language"] = language
+        sess["locked_language"] = None
 
     suffix = Path(file.filename or "chunk.webm").suffix or ".webm"
     chunk_path = sess["chunks_dir"] / f"chunk-{seq:04d}{suffix}"
@@ -161,9 +181,15 @@ async def post_chunk(
 
     # User-forced language always wins; otherwise reuse the locked language
     # from the first confident detection in this session.
-    effective_language = sess["language"]
-    if effective_language == "auto" and sess.get("locked_language"):
-        effective_language = sess["locked_language"]
+    user_lang = sess["language"]
+    language_source = "user"
+    effective_language = user_lang
+    if effective_language == "auto":
+        if sess.get("locked_language"):
+            effective_language = sess["locked_language"]
+            language_source = "locked"
+        else:
+            language_source = "detected"
 
     # openai-whisper is not thread-safe; serialize per session.
     async with sess["lock"]:
@@ -192,6 +218,7 @@ async def post_chunk(
 
         if lock_now and sess.get("locked_language") is None:
             sess["locked_language"] = language_tag
+            language_source = "locked"
             logger.info(
                 "live_language_locked",
                 extra={
@@ -200,6 +227,28 @@ async def post_chunk(
                 },
             )
 
+    # Pure RMS-silence drops surface "unknown" language with dropped=True;
+    # tag them distinctly so the UI can show "silence" instead of "auto".
+    if dropped and language_tag == "unknown":
+        language_source = "silence"
+
+    language_locked = bool(sess.get("locked_language")) and user_lang == "auto"
+
+    # Persist non-empty chunks to the DB now (not at consolidation) so the
+    # canonical transcript is identical to what the user saw live. The
+    # consolidation pass only stitches audio + updates metadata after this.
+    start_ts = sess["ts_cursor"]
+    end_ts = start_ts + duration_s
+    sess["ts_cursor"] = end_ts
+    if not dropped and redacted_text:
+        await _persist_live_segment(
+            recording_id=recording_id,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            language_tag=language_tag,
+            redacted_text=redacted_text,
+        )
+
     logger.info(
         "live_chunk_decoded",
         extra={
@@ -207,6 +256,8 @@ async def post_chunk(
             "seq": seq,
             "duration_s": round(duration_s, 2),
             "language_tag": language_tag,
+            "language_source": language_source,
+            "language_locked": language_locked,
             "redaction_count": redaction_count,
             "dropped": dropped,
         },
@@ -217,6 +268,8 @@ async def post_chunk(
         redacted_text=redacted_text,
         redacted_text_roman=redacted_text_roman,
         language_tag=language_tag,
+        language_locked=language_locked,
+        language_source=language_source,
         redaction_count=redaction_count,
         duration_s=duration_s,
         dropped=dropped,
@@ -274,6 +327,7 @@ def _decode_chunk_sync(
         True if the caller should lock this language for the session.
     """
     import librosa  # type: ignore
+    import numpy as np  # type: ignore
     import whisper as _whisper  # type: ignore
 
     from src.asr.engine import WhisperEngine
@@ -282,6 +336,13 @@ def _decode_chunk_sync(
 
     audio, _sr = librosa.load(str(chunk_path), sr=16000, mono=True)
     duration_s = float(len(audio)) / 16000.0
+
+    # Hard silence gate — Whisper's no_speech_threshold isn't enough; it still
+    # invents text on quiet clips. RMS check below ~-46 dBFS means the chunk
+    # is effectively silent, so skip the model entirely and emit nothing.
+    rms = float(np.sqrt(np.mean(audio ** 2))) if audio.size > 0 else 0.0
+    if rms < 0.005:
+        return "", None, 0, language if language and language != "auto" else "unknown", duration_s, True, False
 
     engine = WhisperEngine.get_instance(settings)
     model = engine._model  # noqa: SLF001
@@ -326,14 +387,34 @@ def _decode_chunk_sync(
     lang_tag = detected_lang or "unknown"
 
     # === REDACTION BOUNDARY === raw_text dies here.
+    # Collapse "9 6 5 9 2 9"-style digit runs first so the phone / ID
+    # recognizers see "965929" and actually fire.
+    from src.normalize.digits import collapse_digit_runs
+
+    raw_text = collapse_digit_runs(raw_text)
     redact_lang = lang_tag if lang_tag in {"en", "hi", "ur", "ta", "id", "ms"} else "en"
     redacted_text, redaction_map = redact(raw_text, redact_lang)
+    redaction_count = len(redaction_map)
     redacted_roman = to_roman(redacted_text, lang_tag)
+
+    # Dual-pass: the first call ran pattern recognizers + English NER only
+    # when lang == 'en'. For non-English chunks we additionally run the
+    # English-NER pass over the romanized text to catch Latin-script PHI
+    # the first pass couldn't see (names, English-script numbers spoken
+    # into Hindi/Urdu/Tamil audio).
+    if redacted_roman and lang_tag != "en":
+        roman_redacted, roman_map = redact(
+            collapse_digit_runs(redacted_roman), "en"
+        )
+        if roman_map:
+            redacted_roman = roman_redacted
+            redaction_count += len(roman_map)
+
     lock_now = (not user_forced) and lang_prob >= LANG_LOCK_THRESHOLD
     return (
         redacted_text,
         redacted_roman,
-        len(redaction_map),
+        redaction_count,
         lang_tag,
         duration_s,
         False,
@@ -342,17 +423,91 @@ def _decode_chunk_sync(
 
 
 # --------------------------------------------------------------------------- #
-# Consolidation — run full Option A pipeline on the stitched audio.
+# Per-chunk DB persistence.
+#
+# Each live chunk's decode is written to the canonical Segment +
+# TranscriptSpan tables immediately so consolidation can't drift away from
+# what the user already saw on screen.
+# --------------------------------------------------------------------------- #
+async def _persist_live_segment(
+    *,
+    recording_id: str,
+    start_ts: float,
+    end_ts: float,
+    language_tag: str,
+    redacted_text: str,
+) -> None:
+    import json as _json
+    from uuid import uuid4
+
+    from src.db.models import Segment, TranscriptSpan  # type: ignore
+    from src.db.session import AsyncSessionLocal  # type: ignore
+
+    try:
+        async with AsyncSessionLocal() as session:
+            seg = Segment(
+                id=str(uuid4()),
+                recording_id=recording_id,
+                speaker_id="S1",
+                start_ts=float(start_ts),
+                end_ts=float(end_ts),
+                confidence="med",
+                language_tag=language_tag,
+                overlap_flag=0,
+                stem_used=0,
+            )
+            span = TranscriptSpan(
+                segment_id=seg.id,
+                redacted_text=redacted_text,
+                redaction_map=_json.dumps([]),
+                word_count=len(redacted_text.split()),
+                char_count=len(redacted_text),
+            )
+            session.add_all([seg, span])
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "live_segment_persist_failed",
+            extra={
+                "recording_id_prefix": recording_id[:8],
+                "error_type": type(exc).__name__,
+            },
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Consolidation — single-speaker live-mode path.
+#
+# We intentionally do NOT run the full Option A pipeline (ConvTasNet +
+# pyannote) on live-stitched audio. The live recorder captures one mic /
+# one speaker; ConvTasNet trained on Libri2Mix fabricates noise stems on
+# single-speaker audio, and energy-fallback diarization over-splits the
+# stream into S1/S2/S3 producing 1-second turns full of Whisper
+# hallucinations (the "KwiJeuonian / rophamaAiMaJwim Blue" effect).
+#
+# Instead we re-transcribe the stitched audio once with Whisper, redact
+# the same way the live ticker did, and persist as a single-speaker
+# (`option_b_single`) recording. The canonical transcript ends up
+# matching what the user already saw live.
 # --------------------------------------------------------------------------- #
 async def _consolidate(
-    recording_id: str, chunks_dir: Path, scenario: str, language: str
+    recording_id: str, chunks_dir: Path, _scenario: str, _language: str
 ) -> None:
-    """Stitch all chunks into one file, then hand off to the batch pipeline.
-
-    The batch pipeline writes the canonical transcript with proper speaker
-    labels (S1/S2…), runs the SI-SDR gate, and produces the metrics row.
+    """Thin consolidation: stitch audio, update recording metadata, write
+    metrics. The transcript is already in the DB from per-chunk persistence
+    in :func:`_persist_live_segment`, so we do NOT re-run Whisper here — that
+    used to produce slightly different tokenization than the live chunks
+    and degraded redaction accuracy.
     """
-    from src.api.routes import _run_pipeline
+    from src.api.routes import _set_progress
+
+    _set_progress(
+        recording_id,
+        status="processing",
+        progress=0.7,
+        stage="consolidating",
+        track_mode="option_b_single",
+    )
 
     stitched = Path(settings.AUDIO_STORAGE_PATH) / f"{recording_id}.wav"
     try:
@@ -365,18 +520,87 @@ async def _consolidate(
                 "error_type": type(exc).__name__,
             },
         )
+        _set_progress(recording_id, status="error", stage="error", progress=1.0)
         return
 
     try:
-        await _run_pipeline(recording_id, stitched, scenario, language)
+        await _finalize_live_recording(recording_id, stitched)
     except Exception as exc:  # noqa: BLE001
         logger.exception(
-            "live_consolidate_pipeline_failed",
+            "live_consolidate_finalize_failed",
             extra={
                 "recording_id_prefix": recording_id[:8],
                 "error_type": type(exc).__name__,
             },
         )
+        _set_progress(recording_id, status="error", stage="error", progress=1.0)
+        return
+
+    _set_progress(
+        recording_id,
+        status="done",
+        stage="done",
+        progress=1.0,
+        track_mode="option_b_single",
+    )
+    logger.info(
+        "live_consolidation_done",
+        extra={"recording_id_prefix": recording_id[:8]},
+    )
+
+
+async def _finalize_live_recording(recording_id: str, stitched_path: Path) -> None:
+    """Update Recording with stitched-audio metadata and write a metrics row.
+
+    Transcript rows are already in place from per-chunk persistence; this
+    only touches Recording + MetricsRun.
+    """
+    import hashlib
+    from datetime import datetime, timezone
+
+    from sqlalchemy import func, select as _select
+
+    from src.db.models import MetricsRun, Recording, Segment  # type: ignore
+    from src.db.session import AsyncSessionLocal  # type: ignore
+
+    file_hash = hashlib.sha256(stitched_path.read_bytes()).hexdigest()
+
+    import soundfile as sf  # type: ignore
+
+    info = sf.info(str(stitched_path))
+    duration_s = float(info.frames) / float(info.samplerate)
+
+    async with AsyncSessionLocal() as session:
+        seg_count_row = await session.execute(
+            _select(func.count(Segment.id)).where(
+                Segment.recording_id == recording_id
+            )
+        )
+        seg_count = int(seg_count_row.scalar_one() or 0)
+
+        rec = await session.get(Recording, recording_id)
+        if rec is not None:
+            rec.file_hash = file_hash
+            rec.duration_s = duration_s
+            rec.track_mode = "option_b_single"
+            rec.si_sdr = None
+            rec.speaker_count = 1
+
+        session.add(
+            MetricsRun(
+                recording_id=recording_id,
+                wer=None,
+                medical_ter=None,
+                der_proxy=None,
+                si_sdr=None,
+                speaker_count=1,
+                segment_count=seg_count,
+                track_mode="option_b_single",
+                run_at=datetime.now(timezone.utc).isoformat(),
+                report_path=None,
+            )
+        )
+        await session.commit()
 
 
 def _stitch_sync(chunks_dir: Path, dest: Path) -> None:

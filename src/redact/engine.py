@@ -114,6 +114,9 @@ class RedactionEngine:
             "PHONE_IN",
             "CNIC_PK",
             "NIK_INDONESIA",
+            # Catch-all for 7-16 digit sequences not matched by a country
+            # specific recognizer (live transcripts often produce these).
+            "GENERIC_NUMERIC_ID",
         ]
 
         analyzer_results = self._analyzer.analyze(

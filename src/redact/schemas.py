@@ -29,6 +29,7 @@ class RedactionType(str, Enum):
     PK_CNIC = "CNIC_PK"
     ID_IN = "AADHAAR"
     NIK_ID = "NIK_INDONESIA"
+    GENERIC_NUMERIC = "GENERIC_NUMERIC_ID"
 
 
 class RedactionSpan(BaseModel):

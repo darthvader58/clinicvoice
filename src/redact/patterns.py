@@ -98,6 +98,70 @@ class IndonesianNIKRecognizer(PatternRecognizer):
         super().__init__(supported_entity="NIK_INDONESIA", patterns=self.PATTERNS)
 
 
+class LongDigitRecognizer(PatternRecognizer):
+    """Catch-all for 7-16 contiguous digits not matched by a specific recognizer.
+
+    Live transcripts often pick up phone numbers / MRNs / hospital IDs in
+    formats that don't fit the country-specific patterns above (for example
+    the speaker says digits one by one and Whisper collapses them after
+    digit-run normalization, but no country prefix is present). Anything
+    7+ digits in a row is almost certainly PHI in a clinical setting, so
+    we redact it. Score is lower than country-specific recognizers so they
+    win when they apply.
+
+    Boundary chars (\\b) require a non-digit on either side, which keeps
+    this from over-firing inside longer numeric ranges or already-redacted
+    placeholders.
+    """
+
+    PATTERNS = [Pattern("LONG_DIGITS", r"\b\d{7,16}\b", 0.60)]
+
+    def __init__(self) -> None:
+        super().__init__(supported_entity="GENERIC_NUMERIC_ID", patterns=self.PATTERNS)
+
+
+class NameContextRecognizer(PatternRecognizer):
+    """Capture title-cased names that follow common introduction phrases.
+
+    Presidio's ``en_core_web_sm`` NER misses single first names like
+    ``Rajesh`` or ``Aisha`` unless a surname is also present — bad for our
+    use case where patients often say ``mera naam Rajesh hai`` or
+    ``my name is Rajesh``. This recognizer matches the cue word/phrase
+    and a following title-cased token, returning a single span covering
+    just the name (the cue itself is not redacted).
+
+    Cues covered: English (`my name is`, `i am`, `i'm`, `name`),
+    romanized Hindi/Urdu (`naam`, `mera naam`, `meraa naam`, `mein`,
+    `main`), and the no-cue case where a single title-case name appears
+    between two such cues. Latin-only by design — Devanagari/Arabic
+    script names fall to the language-specific pattern set.
+    """
+
+    PATTERNS = [
+        # English: "my name is Rajesh"
+        Pattern(
+            "EN_INTRO_NAME",
+            r"(?i)\b(?:my\s+name\s+is|i\s+am|i'?m)\s+([A-Z][a-z]{1,20})\b",
+            0.75,
+        ),
+        # Romanized Hindi/Urdu: "naam Rajesh", "meraa naam Rajesh"
+        Pattern(
+            "HI_NAAM_NAME",
+            r"(?i)\b(?:mera+|meraa|meri|mere)?\s*naa?m\s+([A-Z][a-z]{1,20})\b",
+            0.80,
+        ),
+        # Romanized Hindi: "main Rajesh", "mein Rajesh hu/hun"
+        Pattern(
+            "HI_MAIN_NAME",
+            r"(?i)\b(?:mein|main)\s+([A-Z][a-z]{1,20})\b",
+            0.70,
+        ),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__(supported_entity="PERSON", patterns=self.PATTERNS)
+
+
 class DOBRecognizer(PatternRecognizer):
     """Dates of birth in slash, dash, or 'born/DOB:' textual forms."""
 
@@ -126,6 +190,8 @@ ALL_CUSTOM_RECOGNIZERS = [
     PakistaniCNICRecognizer(),
     IndonesianNIKRecognizer(),
     DOBRecognizer(),
+    LongDigitRecognizer(),
+    NameContextRecognizer(),
 ]
 
 

@@ -91,6 +91,7 @@ class TranscriptSegmentOut(BaseModel):
     overlap_flag: bool
     stem_used: bool
     redacted_text: str
+    redacted_text_roman: str | None = None
     redaction_map: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -536,6 +537,8 @@ async def get_transcript(recording_id: str) -> TranscriptResponse:
         )
         rows = (await session.execute(stmt)).all()
 
+        from src.normalize.romanize import to_roman
+
         segs: list[TranscriptSegmentOut] = []
         for seg, span in rows:
             try:
@@ -553,6 +556,7 @@ async def get_transcript(recording_id: str) -> TranscriptResponse:
                     overlap_flag=bool(seg.overlap_flag),
                     stem_used=bool(seg.stem_used),
                     redacted_text=span.redacted_text,
+                    redacted_text_roman=to_roman(span.redacted_text, seg.language_tag),
                     redaction_map=redaction_map,
                 )
             )

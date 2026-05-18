@@ -1,11 +1,19 @@
 // Recorder.js — MediaRecorder-based audio capture with live waveform.
 //
 // Public API:
-//   const rec = createRecorder({ onUpload({ file, scenario }) {...}, onError(err) })
+//   const rec = createRecorder({
+//     onUpload({ file, scenario, language, result }) {...},
+//     onLiveStart({ recording_id, language }) {...},
+//     onLiveChunk({ recording_id, seq, redacted_text, language_tag, duration_s }) {...},
+//     onLiveStop({ recording_id, chunks }) {...},
+//     onError(err),
+//   })
 //   rec.mount(container)
 //   rec.destroy()
 
 import { api } from '../api.js'
+
+const LIVE_CHUNK_MS = 10000  // rotate MediaRecorder every 10s for live mode
 
 const PREFERRED_MIME_TYPES = [
   'audio/webm;codecs=opus',
@@ -30,7 +38,13 @@ function formatDuration(seconds) {
   return `${m}:${String(r).padStart(2, '0')}`
 }
 
-export function createRecorder({ onUpload, onError } = {}) {
+export function createRecorder({
+  onUpload,
+  onLiveStart,
+  onLiveChunk,
+  onLiveStop,
+  onError,
+} = {}) {
   const state = {
     recording: false,
     uploading: false,
@@ -44,6 +58,11 @@ export function createRecorder({ onUpload, onError } = {}) {
     durationTimer: null,
     scenario: 'unknown',
     language: 'auto',
+    mode: 'live',
+    liveRecordingId: null,
+    liveSeq: 0,
+    liveRotateTimer: null,
+    liveMime: '',
   }
 
   let root
@@ -57,6 +76,7 @@ export function createRecorder({ onUpload, onError } = {}) {
   let dropZone
   let scenarioSel
   let languageSel
+  let modeSel
 
   function render(container) {
     root = document.createElement('section')
@@ -82,6 +102,14 @@ export function createRecorder({ onUpload, onError } = {}) {
             <span class="record-dot" aria-hidden="true"></span>
             <span class="record-label">Start recording</span>
           </button>
+
+          <label class="field">
+            <span class="field-label">Mode</span>
+            <select data-role="mode" class="select">
+              <option value="live" selected>Live (rolling chunks)</option>
+              <option value="batch">Batch (upload at end)</option>
+            </select>
+          </label>
 
           <label class="field">
             <span class="field-label">Scenario</span>
@@ -129,6 +157,7 @@ export function createRecorder({ onUpload, onError } = {}) {
     dropZone = root.querySelector('[data-role="drop"]')
     scenarioSel = root.querySelector('[data-role="scenario"]')
     languageSel = root.querySelector('[data-role="language"]')
+    modeSel = root.querySelector('[data-role="mode"]')
 
     bindEvents()
     drawIdleWaveform()
@@ -141,6 +170,9 @@ export function createRecorder({ onUpload, onError } = {}) {
     })
     languageSel.addEventListener('change', () => {
       state.language = languageSel.value
+    })
+    modeSel.addEventListener('change', () => {
+      state.mode = modeSel.value
     })
 
     root.querySelector('[data-role="browse"]').addEventListener('click', () => {
@@ -173,9 +205,129 @@ export function createRecorder({ onUpload, onError } = {}) {
   async function toggleRecording() {
     if (state.uploading) return
     if (state.recording) {
-      stopRecording()
+      if (state.mode === 'live') await stopLiveRecording()
+      else stopRecording()
     } else {
-      await startRecording()
+      if (state.mode === 'live') await startLiveRecording()
+      else await startRecording()
+    }
+  }
+
+  async function startLiveRecording() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      return setStatus('Browser does not support microphone access.', 'error')
+    }
+    const mime = pickMimeType()
+    if (mime === null) {
+      return setStatus('MediaRecorder is not available in this browser.', 'error')
+    }
+    state.liveMime = mime || 'audio/webm'
+
+    try {
+      state.stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    } catch (err) {
+      reportError(err)
+      return setStatus('Microphone permission denied.', 'error')
+    }
+
+    try {
+      const startResp = await api.streamStart(state.scenario, state.language)
+      state.liveRecordingId = startResp.recording_id
+      state.liveSeq = 0
+      if (onLiveStart)
+        onLiveStart({ recording_id: state.liveRecordingId, language: state.language })
+    } catch (err) {
+      reportError(err)
+      stopMediaTracks()
+      return setStatus(`Could not start live session: ${err.message}`, 'error')
+    }
+
+    setupAnalyser(state.stream)
+    state.recording = true
+    state.startedAt = performance.now()
+    setRecordingUi(true)
+    setStatus(`Live — chunk every ${LIVE_CHUNK_MS / 1000}s`, 'recording')
+    tickDuration()
+    drawLiveWaveform()
+
+    rotateLiveChunk()  // kick off the first chunk recorder immediately
+    state.liveRotateTimer = setInterval(rotateLiveChunk, LIVE_CHUNK_MS)
+  }
+
+  function rotateLiveChunk() {
+    // Stop the current recorder (its onstop will upload), then immediately
+    // start a fresh recorder on the same MediaStream so we never miss audio.
+    const previous = state.mediaRecorder
+    if (previous && previous.state !== 'inactive') {
+      try {
+        previous.stop()
+      } catch (err) {
+        reportError(err)
+      }
+    }
+    if (!state.recording || !state.stream) return
+
+    let recorder
+    try {
+      recorder = new MediaRecorder(
+        state.stream,
+        state.liveMime ? { mimeType: state.liveMime } : undefined,
+      )
+    } catch (err) {
+      reportError(err)
+      return
+    }
+    const chunkBuf = []
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunkBuf.push(e.data)
+    }
+    recorder.onstop = async () => {
+      if (chunkBuf.length === 0) return
+      const blob = new Blob(chunkBuf, { type: state.liveMime })
+      const ext = (state.liveMime.split('/')[1] || 'webm').split(';')[0]
+      const filename = `chunk-${Date.now()}.${ext}`
+      try {
+        const resp = await api.streamChunk(state.liveRecordingId, blob, filename)
+        state.liveSeq = (resp.seq ?? state.liveSeq) + 1
+        if (onLiveChunk) onLiveChunk(resp)
+      } catch (err) {
+        reportError(err)
+      }
+    }
+    recorder.onerror = (e) => reportError(e.error || new Error('MediaRecorder error'))
+    state.mediaRecorder = recorder
+    recorder.start()
+  }
+
+  async function stopLiveRecording() {
+    if (state.liveRotateTimer) {
+      clearInterval(state.liveRotateTimer)
+      state.liveRotateTimer = null
+    }
+    // Flush the final chunk: stop the active recorder so its onstop fires
+    // and uploads the tail. Wait briefly to give the upload a chance.
+    if (state.mediaRecorder && state.mediaRecorder.state !== 'inactive') {
+      try {
+        state.mediaRecorder.stop()
+      } catch (err) {
+        reportError(err)
+      }
+    }
+    state.recording = false
+    setRecordingUi(false)
+    cancelAnimationFrame(state.rafId)
+    stopMediaTracks()
+    setStatus('Stopping — consolidating final transcript…', 'uploading')
+    try {
+      const resp = await api.streamStop(state.liveRecordingId)
+      setStatus(
+        `Live session ended. Consolidating ${resp.chunks} chunks into final transcript…`,
+        'success',
+      )
+      if (onLiveStop) onLiveStop(resp)
+    } catch (err) {
+      reportError(err)
+      setStatus(`Could not stop live session: ${err.message}`, 'error')
     }
   }
 
